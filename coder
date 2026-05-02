@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve the real path of this script even when invoked via a symlink in PATH,
+# so we can find agents.json living next to the original script.
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+AGENTS_FILE="$SCRIPT_DIR/agents.json"
+
+if [[ ! -f "$AGENTS_FILE" ]]; then
+  echo "coder: agents.json not found at $AGENTS_FILE" >&2
+  exit 1
+fi
+
+print_help() {
+  cat <<'EOF'
+coder — run a self-contained orchestrator/coder/reviewer loop on a coding task.
+
+USAGE
+  coder <prompt>...           Prompt taken from arguments (joined by spaces).
+  echo <prompt> | coder       Prompt taken from stdin.
+  coder -h | --help           Show this help and exit.
+
+WHAT IT DOES
+  Launches Claude Code non-interactively with three subagents defined in
+  agents.json (sitting next to this script):
+    - orchestrator : owns the prompt; never edits files; dispatches the others.
+    - coder        : implements changes and writes/runs tests.
+    - reviewer     : read-only review; returns BLOCKER / NIT / PRAISE findings.
+  The orchestrator loops coder→reviewer until the reviewer returns no blockers
+  (max 3 cycles), then prints a final summary.
+
+WORKING DIRECTORY
+  Operates on the current working directory. Run it from the repo root (or
+  whatever subtree you want it to touch). cwd is inherited as-is — the script
+  does not cd anywhere.
+
+INVOCATION MODEL
+  Fully non-interactive. The run executes to completion in a single shot:
+    - It cannot ask the caller follow-up questions. If the prompt is ambiguous,
+      the orchestrator will make reasonable assumptions and proceed; surface
+      any uncertainty by being explicit in the prompt.
+    - It runs with bypassed permissions, so it WILL edit files and execute
+      shell commands (build, test, git read-only) without prompting. Only run
+      it on a repo whose state you are willing to have modified. Uncommitted
+      work may be touched.
+    - It does NOT push, open PRs, or commit unless the prompt explicitly says
+      to. (Even then, prefer letting the human commit.)
+
+GOOD PROMPTS
+  One focused unit of work, with a clear definition of done. Examples:
+    coder "add a --dry-run flag to scripts/deploy.sh that prints the rsync
+           command instead of running it. Add a bats test."
+    coder "fix the off-by-one in pkg/parse/lexer.go:tokenize when input ends
+           with a backslash. Cover with a unit test."
+  Avoid open-ended prompts ("clean up the codebase") — the orchestrator will
+  pick a narrow interpretation that may not match your intent.
+
+OUTPUT
+  Progress streams live to stdout as the agents work, prefixed by which
+  agent is talking (ORCHESTRATOR:, CODER:, REVIEWER:) and tool calls in
+  square brackets. The final orchestrator reply is preceded by a line
+  containing exactly:  === final ===
+  Anything between the last "=== final ===" and EOF is the canonical result
+  for programmatic consumers.
+
+SESSION LOGS
+  Every run is logged to:
+    ${CODER_LOG_DIR:-~/.local/state/coder}/sessions/<UTC-timestamp>-<pid>/
+      prompt.txt       the prompt as received
+      meta.txt         session id, cwd, start/end time, exit code
+      raw.jsonl        full event stream from Claude (one JSON object per line)
+      transcript.txt   the formatted human-readable output
+  A symlink `sessions/latest` always points to the most recent session.
+
+ENVIRONMENT
+  CODER_LOG_DIR   Override the log root (default: $XDG_STATE_HOME/coder
+                  or ~/.local/state/coder).
+  CODER_RAW=1     Show raw JSONL events on screen instead of the formatted
+                  transcript. The log files are written either way.
+
+EXIT CODES
+  0   run completed (reviewer approved, or loop cap reached — check transcript)
+  1   missing agents.json next to the script
+  2   no prompt supplied (no args and stdin is a tty)
+  *   any other code is propagated from `claude` itself
+
+REQUIREMENTS
+  claude (Claude Code CLI) on PATH, jq on PATH, agents.json next to this
+  script's real path (symlinks are followed via readlink -f).
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  print_help
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  prompt="$*"
+elif [[ ! -t 0 ]]; then
+  prompt="$(cat)"
+else
+  print_help >&2
+  echo >&2
+  echo "error: no prompt supplied" >&2
+  exit 2
+fi
+
+# --- session log setup ---------------------------------------------------
+LOG_ROOT="${CODER_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/coder}"
+SESSION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+SESSION_DIR="$LOG_ROOT/sessions/$SESSION_ID"
+mkdir -p "$SESSION_DIR"
+
+printf '%s\n' "$prompt" > "$SESSION_DIR/prompt.txt"
+{
+  echo "session_id: $SESSION_ID"
+  echo "cwd:        $PWD"
+  echo "started:    $(date -Iseconds)"
+  echo "agents:     $AGENTS_FILE"
+} > "$SESSION_DIR/meta.txt"
+
+# Maintain a `latest` symlink so you can `cat $LOG_ROOT/sessions/latest/transcript.txt`.
+ln -sfn "$SESSION_ID" "$LOG_ROOT/sessions/latest"
+
+# Append end time + exit code on the way out, regardless of how we exit.
+trap '{
+  rc=$?
+  echo "ended:      $(date -Iseconds)"
+  echo "exit_code:  $rc"
+} >> "$SESSION_DIR/meta.txt"' EXIT
+
+echo "[session: $SESSION_DIR]" >&2
+# -------------------------------------------------------------------------
+
+# stream-json + verbose emits one JSON event per line as the run progresses.
+# Pipeline:
+#   claude → tee raw.jsonl → formatter (jq) → tee transcript.txt → terminal
+# Set CODER_RAW=1 to skip the formatter and show raw JSONL on screen
+# (the files are still written either way).
+
+format_stream() {
+  if [[ "${CODER_RAW:-0}" == "1" ]]; then
+    cat
+  else
+    jq -r --unbuffered '
+      (.subagent_type // .agent // .message.subagent_type // "orchestrator") as $who
+      | if .type == "system" and (.subtype // "") == "init" then
+          "[init] session started"
+        elif .type == "assistant" then
+          (.message.content // [])
+          | map(
+              if .type == "text" then
+                ($who | ascii_upcase) + ": " + (.text // "")
+              elif .type == "tool_use" then
+                "[" + $who + " → tool: " + (.name // "?")
+                + (if .input.subagent_type then " (" + .input.subagent_type + ")" else "" end)
+                + (if .input.description then " — " + .input.description else "" end)
+                + "]"
+              else empty end
+            )
+          | .[]
+        elif .type == "user" then
+          (.message.content // [])
+          | map(
+              if .type == "tool_result" then
+                "[result ← " + $who + "]"
+              else empty end
+            )
+          | .[]
+        elif .type == "result" then
+          "\n=== final ===\n" + (.result // "")
+        else empty end
+    '
+  fi
+}
+
+claude \
+  --agents "$(cat "$AGENTS_FILE")" \
+  --agent orchestrator \
+  --permission-mode bypassPermissions \
+  --print \
+  --output-format stream-json \
+  --verbose \
+  "$prompt" \
+| tee "$SESSION_DIR/raw.jsonl" \
+| format_stream \
+| tee "$SESSION_DIR/transcript.txt"
