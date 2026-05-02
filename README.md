@@ -93,6 +93,14 @@ A `sessions/latest` symlink always points to the most recent session, so:
 cat ~/.local/state/coder/sessions/latest/transcript.txt
 ```
 
+Or use the built-in interactive picker:
+
+```bash
+coder logs
+```
+
+Shows the 5 most recent sessions with status (`RUNNING` / `done` / `killed`), local time, and the first line of the prompt as a hint. Move with ↑/↓ (or `j`/`k`), `Enter` to view, `q` to quit. Picking an active session follows it live (`tail -f`) and exits when the session finishes; picking a finished one pages the transcript.
+
 ## Environment
 
 | Variable          | Effect                                                                |

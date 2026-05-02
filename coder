@@ -19,16 +19,26 @@ coder — run a self-contained orchestrator/coder/reviewer loop on a coding task
 USAGE
   coder [options] <prompt>...     Prompt taken from arguments (joined by spaces).
   echo <prompt> | coder [options] Prompt taken from stdin.
+  coder logs [options]            Browse and view past/active session logs.
   coder -h | --help               Show this help and exit.
 
 OPTIONS
   --log-dir <path>   Write session logs under <path>/sessions/<id>/ instead of
                      the default location. Useful when running in a sandbox
-                     that does not allow writes to ~/.local/state.
+                     that does not allow writes to ~/.local/state. With
+                     `coder logs`, this is where sessions are read from.
   --no-log           Do not write any log files. Output still streams to the
                      terminal but nothing is persisted. Use this when no
                      filesystem location is writable.
   --                 End of options. Everything after is treated as the prompt.
+
+SUBCOMMAND: logs
+  coder logs                Show an interactive picker of the 5 most recent
+                            sessions (running and past). Use ↑/↓ (or j/k) to
+                            move, Enter to view, q to quit. The chosen
+                            transcript is shown; for a session that is still
+                            running, the view follows it live (tail -f) and
+                            exits when the session ends.
 
 WHAT IT DOES
   Launches Claude Code non-interactively with three subagents defined in
@@ -106,6 +116,191 @@ REQUIREMENTS
 EOF
 }
 
+# --- `coder logs` subcommand ---------------------------------------------
+# Interactive picker over recent session log dirs. Shows status (RUNNING /
+# done / killed), human time, and the first line of the prompt as a hint.
+# On selection: tail -f the transcript for active sessions (exits when the
+# session pid dies), or page the transcript for finished ones.
+
+cmd_logs() {
+  local count=5
+
+  local log_root
+  if [[ -n "$LOG_ROOT_OVERRIDE" ]]; then
+    log_root="$LOG_ROOT_OVERRIDE"
+  else
+    log_root="${CODER_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/coder}"
+  fi
+  local sessions_dir="$log_root/sessions"
+
+  if [[ ! -d "$sessions_dir" ]]; then
+    echo "coder logs: no sessions directory at $sessions_dir" >&2
+    exit 1
+  fi
+
+  # Session ids sort lexically the same as chronologically (UTC stamp prefix),
+  # so a reverse name sort gives newest-first. The `latest` symlink is
+  # type=l, not type=d, so it's naturally excluded.
+  local session_dirs=()
+  while IFS= read -r d; do
+    session_dirs+=("$d")
+  done < <(find "$sessions_dir" -mindepth 1 -maxdepth 1 -type d | sort -r | head -n "$count")
+
+  if [[ ${#session_dirs[@]} -eq 0 ]]; then
+    echo "coder logs: no sessions found in $sessions_dir" >&2
+    exit 1
+  fi
+
+  if [[ ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+    echo "coder logs: requires a TTY for interactive selection" >&2
+    exit 1
+  fi
+
+  local labels=() statuses=() pids=()
+  local i
+  for i in "${!session_dirs[@]}"; do
+    local dir="${session_dirs[$i]}"
+    local sid
+    sid=$(basename "$dir")
+
+    # Status: meta.txt gets `exit_code:` appended in the EXIT trap of a run.
+    # If absent and the recorded pid is still alive → RUNNING. Otherwise it
+    # was killed before the trap could fire (e.g. SIGKILL, host crash).
+    local pid="${sid##*-}"
+    local status
+    if [[ -f "$dir/meta.txt" ]] && grep -q '^exit_code:' "$dir/meta.txt"; then
+      status="done   "
+    elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      status="RUNNING"
+    else
+      status="killed "
+    fi
+    statuses+=("$status")
+    pids+=("$pid")
+
+    # Convert UTC stamp in session id to local-tz human time when possible.
+    local ts="${sid%%-*}"           # 20260502T142301Z
+    local d="${ts:0:8}"             # 20260502
+    local t="${ts:9:6}"             # 142301
+    local human
+    human=$(date -d "${d:0:4}-${d:4:2}-${d:6:2}T${t:0:2}:${t:2:2}:${t:4:2}Z" '+%Y-%m-%d %H:%M' 2>/dev/null) \
+      || human="${d:0:4}-${d:4:2}-${d:6:2} ${t:0:2}:${t:2:2}"
+
+    local preview="(no prompt)"
+    if [[ -s "$dir/prompt.txt" ]]; then
+      preview=$(head -n1 "$dir/prompt.txt" | tr '\t' ' ' | tr -d '\r')
+      [[ -z "$preview" ]] && preview="(empty prompt)"
+    fi
+    local maxw=60
+    if [[ ${#preview} -gt $maxw ]]; then
+      preview="${preview:0:$((maxw - 1))}…"
+    fi
+
+    labels+=("[$status] $human  $preview")
+  done
+
+  # --- interactive menu --------------------------------------------------
+  local n=${#labels[@]}
+  local sel=0
+
+  local stty_orig
+  stty_orig=$(stty -g </dev/tty)
+  _logs_cleanup() {
+    [[ -n "${stty_orig:-}" ]] && stty "$stty_orig" </dev/tty 2>/dev/null || true
+    printf '\033[?25h' >/dev/tty 2>/dev/null || true   # show cursor
+  }
+  trap _logs_cleanup EXIT INT TERM
+
+  stty -echo -icanon min 1 time 0 </dev/tty
+  printf '\033[?25l' >/dev/tty                          # hide cursor
+
+  printf 'coder logs — pick a session (↑/↓ or j/k to move, Enter to view, q to quit)\n\n' >/dev/tty
+
+  _draw() {
+    local j
+    for j in "${!labels[@]}"; do
+      if [[ $j -eq $sel ]]; then
+        printf '\033[7m> %s\033[0m\n' "${labels[$j]}" >/dev/tty
+      else
+        printf '  %s\n' "${labels[$j]}" >/dev/tty
+      fi
+    done
+  }
+
+  _draw
+
+  while true; do
+    local key
+    IFS= read -rsn1 key </dev/tty || break
+    case "$key" in
+      $'\x1b')
+        # arrow key: ESC [ A/B/C/D. Use plain assignments rather than ((sel++))
+        # — under `set -e`, post-increment returning the pre-increment value
+        # of 0 would kill the script the first time you arrow down from the
+        # top entry.
+        local rest=""
+        IFS= read -rsn2 -t 0.1 rest </dev/tty || true
+        case "$rest" in
+          '[A') (( sel > 0 ))     && sel=$((sel - 1)) ;;
+          '[B') (( sel < n - 1 )) && sel=$((sel + 1)) ;;
+        esac
+        ;;
+      '')   break ;;                                    # Enter
+      'k')  (( sel > 0 ))     && sel=$((sel - 1)) ;;
+      'j')  (( sel < n - 1 )) && sel=$((sel + 1)) ;;
+      'q'|'Q') sel=-1; break ;;
+    esac
+    # redraw: cursor up n rows, clear from cursor to end of screen
+    printf '\033[%dA\033[J' "$n" >/dev/tty
+    _draw
+  done
+
+  _logs_cleanup
+  trap - EXIT INT TERM
+
+  if [[ $sel -lt 0 ]]; then
+    return 0
+  fi
+
+  local chosen="${session_dirs[$sel]}"
+  local transcript="$chosen/transcript.txt"
+  local sid pid status
+  sid=$(basename "$chosen")
+  pid="${pids[$sel]}"
+  status="${statuses[$sel]}"
+
+  echo
+  echo "[session: $chosen]"
+  echo
+
+  if [[ ! -f "$transcript" ]]; then
+    echo "coder logs: no transcript at $transcript (session may have written raw events only)" >&2
+    if [[ -f "$chosen/raw.jsonl" ]]; then
+      transcript="$chosen/raw.jsonl"
+      echo "coder logs: showing raw.jsonl instead" >&2
+    else
+      exit 1
+    fi
+  fi
+
+  if [[ "$status" == "RUNNING" ]] && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    # Follow live; --pid lets tail exit cleanly when the writer dies. Fall
+    # back to plain -f if the host's tail doesn't grok --pid.
+    if tail --help 2>&1 | grep -q -- '--pid'; then
+      exec tail -n +1 -f --pid="$pid" "$transcript"
+    else
+      exec tail -n +1 -f "$transcript"
+    fi
+  else
+    if command -v less >/dev/null 2>&1; then
+      exec less -R "$transcript"
+    else
+      exec cat "$transcript"
+    fi
+  fi
+}
+# -------------------------------------------------------------------------
+
 # --- argument parsing ----------------------------------------------------
 LOG_ROOT_OVERRIDE=""
 NO_LOG=0
@@ -131,6 +326,16 @@ while [[ $# -gt 0 ]]; do
       break ;;
   esac
 done
+
+# Subcommand dispatch. Recognised after option parsing so flags like
+# --log-dir apply to subcommands too. `coder logs` is the only subcommand
+# today; if a user genuinely wants "logs" as a literal prompt, they can
+# pass it after `--`.
+if [[ $# -gt 0 && "$1" == "logs" ]]; then
+  shift
+  cmd_logs "$@"
+  exit $?
+fi
 
 if [[ $# -gt 0 ]]; then
   prompt="$*"
