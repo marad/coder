@@ -17,9 +17,18 @@ print_help() {
 coder — run a self-contained orchestrator/coder/reviewer loop on a coding task.
 
 USAGE
-  coder <prompt>...           Prompt taken from arguments (joined by spaces).
-  echo <prompt> | coder       Prompt taken from stdin.
-  coder -h | --help           Show this help and exit.
+  coder [options] <prompt>...     Prompt taken from arguments (joined by spaces).
+  echo <prompt> | coder [options] Prompt taken from stdin.
+  coder -h | --help               Show this help and exit.
+
+OPTIONS
+  --log-dir <path>   Write session logs under <path>/sessions/<id>/ instead of
+                     the default location. Useful when running in a sandbox
+                     that does not allow writes to ~/.local/state.
+  --no-log           Do not write any log files. Output still streams to the
+                     terminal but nothing is persisted. Use this when no
+                     filesystem location is writable.
+  --                 End of options. Everything after is treated as the prompt.
 
 WHAT IT DOES
   Launches Claude Code non-interactively with three subagents defined in
@@ -66,18 +75,24 @@ OUTPUT
 
 SESSION LOGS
   Every run is logged to:
-    ${CODER_LOG_DIR:-~/.local/state/coder}/sessions/<UTC-timestamp>-<pid>/
+    <log-root>/sessions/<UTC-timestamp>-<pid>/
       prompt.txt       the prompt as received
       meta.txt         session id, cwd, start/end time, exit code
       raw.jsonl        full event stream from Claude (one JSON object per line)
       transcript.txt   the formatted human-readable output
   A symlink `sessions/latest` always points to the most recent session.
 
+  <log-root> precedence (highest first):
+    1. --log-dir <path>           CLI flag
+    2. $CODER_LOG_DIR              env var
+    3. $XDG_STATE_HOME/coder       (or ~/.local/state/coder)
+  Use --no-log to skip log writes entirely.
+
 ENVIRONMENT
-  CODER_LOG_DIR   Override the log root (default: $XDG_STATE_HOME/coder
-                  or ~/.local/state/coder).
+  CODER_LOG_DIR   Override the log root. Overridden by --log-dir if both are set.
   CODER_RAW=1     Show raw JSONL events on screen instead of the formatted
-                  transcript. The log files are written either way.
+                  transcript. The log files are written either way (unless
+                  --no-log).
 
 EXIT CODES
   0   run completed (reviewer approved, or loop cap reached — check transcript)
@@ -91,10 +106,31 @@ REQUIREMENTS
 EOF
 }
 
-if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
-  print_help
-  exit 0
-fi
+# --- argument parsing ----------------------------------------------------
+LOG_ROOT_OVERRIDE=""
+NO_LOG=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      print_help; exit 0 ;;
+    --log-dir)
+      [[ $# -ge 2 ]] || { echo "coder: --log-dir requires a path argument" >&2; exit 2; }
+      LOG_ROOT_OVERRIDE="$2"; shift 2 ;;
+    --log-dir=*)
+      LOG_ROOT_OVERRIDE="${1#--log-dir=}"; shift ;;
+    --no-log)
+      NO_LOG=1; shift ;;
+    --)
+      shift; break ;;
+    -*)
+      echo "coder: unknown option: $1" >&2
+      echo "       use -h for help" >&2
+      exit 2 ;;
+    *)
+      break ;;
+  esac
+done
 
 if [[ $# -gt 0 ]]; then
   prompt="$*"
@@ -106,32 +142,54 @@ else
   echo "error: no prompt supplied" >&2
   exit 2
 fi
+# -------------------------------------------------------------------------
 
 # --- session log setup ---------------------------------------------------
-LOG_ROOT="${CODER_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/coder}"
-SESSION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-SESSION_DIR="$LOG_ROOT/sessions/$SESSION_ID"
-mkdir -p "$SESSION_DIR"
+# Precedence for log root: --log-dir > $CODER_LOG_DIR > XDG default.
+# --no-log disables file writes entirely (for sandboxes with no writable path).
+RAW_LOG=/dev/null
+TRANSCRIPT_LOG=/dev/null
 
-printf '%s\n' "$prompt" > "$SESSION_DIR/prompt.txt"
-{
-  echo "session_id: $SESSION_ID"
-  echo "cwd:        $PWD"
-  echo "started:    $(date -Iseconds)"
-  echo "agents:     $AGENTS_FILE"
-} > "$SESSION_DIR/meta.txt"
+if [[ "$NO_LOG" == "1" ]]; then
+  echo "[session logging disabled]" >&2
+else
+  if [[ -n "$LOG_ROOT_OVERRIDE" ]]; then
+    LOG_ROOT="$LOG_ROOT_OVERRIDE"
+  else
+    LOG_ROOT="${CODER_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/coder}"
+  fi
+  SESSION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  SESSION_DIR="$LOG_ROOT/sessions/$SESSION_ID"
 
-# Maintain a `latest` symlink so you can `cat $LOG_ROOT/sessions/latest/transcript.txt`.
-ln -sfn "$SESSION_ID" "$LOG_ROOT/sessions/latest"
+  if ! mkdir -p "$SESSION_DIR" 2>/dev/null; then
+    echo "coder: cannot create log dir at $SESSION_DIR" >&2
+    echo "       use --log-dir <path> to choose a writable location," >&2
+    echo "       or --no-log to run without writing logs." >&2
+    exit 1
+  fi
 
-# Append end time + exit code on the way out, regardless of how we exit.
-trap '{
-  rc=$?
-  echo "ended:      $(date -Iseconds)"
-  echo "exit_code:  $rc"
-} >> "$SESSION_DIR/meta.txt"' EXIT
+  printf '%s\n' "$prompt" > "$SESSION_DIR/prompt.txt"
+  {
+    echo "session_id: $SESSION_ID"
+    echo "cwd:        $PWD"
+    echo "started:    $(date -Iseconds)"
+    echo "agents:     $AGENTS_FILE"
+  } > "$SESSION_DIR/meta.txt"
 
-echo "[session: $SESSION_DIR]" >&2
+  # Maintain a `latest` symlink so you can `cat $LOG_ROOT/sessions/latest/transcript.txt`.
+  ln -sfn "$SESSION_ID" "$LOG_ROOT/sessions/latest" 2>/dev/null || true
+
+  # Append end time + exit code on the way out, regardless of how we exit.
+  trap '{
+    rc=$?
+    echo "ended:      $(date -Iseconds)"
+    echo "exit_code:  $rc"
+  } >> "$SESSION_DIR/meta.txt"' EXIT
+
+  RAW_LOG="$SESSION_DIR/raw.jsonl"
+  TRANSCRIPT_LOG="$SESSION_DIR/transcript.txt"
+  echo "[session: $SESSION_DIR]" >&2
+fi
 # -------------------------------------------------------------------------
 
 # stream-json + verbose emits one JSON event per line as the run progresses.
@@ -184,6 +242,6 @@ claude \
   --output-format stream-json \
   --verbose \
   "$prompt" \
-| tee "$SESSION_DIR/raw.jsonl" \
+| tee "$RAW_LOG" \
 | format_stream \
-| tee "$SESSION_DIR/transcript.txt"
+| tee "$TRANSCRIPT_LOG"
