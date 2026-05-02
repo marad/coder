@@ -408,6 +408,13 @@ format_stream() {
     cat
   else
     jq -r --unbuffered '
+      def cleanline: gsub("\n"; " ") | gsub("[ \t]+"; " ");
+      def trunc(n): if (length // 0) > n then .[:n-1] + "…" else . end;
+      def result_text:
+        if (. | type) == "string" then .
+        elif (. | type) == "array" then (map(.text // "") | join(" "))
+        else (. | tostring) end;
+
       (.subagent_type // .agent // .message.subagent_type // "orchestrator") as $who
       | if .type == "system" and (.subtype // "") == "init" then
           "[init] session started"
@@ -417,18 +424,50 @@ format_stream() {
               if .type == "text" then
                 ($who | ascii_upcase) + ": " + (.text // "")
               elif .type == "tool_use" then
-                "[" + $who + " → tool: " + (.name // "?")
-                + (if .input.subagent_type then " (" + .input.subagent_type + ")" else "" end)
-                + (if .input.description then " — " + .input.description else "" end)
-                + "]"
+                (.input // {}) as $i
+                | (.name // "?") as $tool
+                | "[" + $who + " → " + $tool
+                  + (
+                      if ($tool == "Read" or $tool == "Write" or $tool == "Edit" or $tool == "MultiEdit") then
+                        " " + ($i.file_path // "?")
+                      elif $tool == "NotebookEdit" then
+                        " " + ($i.notebook_path // "?")
+                      elif $tool == "Bash" then
+                        " $ " + (($i.command // "?") | cleanline | trunc(140))
+                      elif $tool == "Grep" then
+                        " /" + ($i.pattern // "") + "/"
+                        + (if $i.path then " in " + $i.path else "" end)
+                        + (if $i.glob then " (" + $i.glob + ")" else "" end)
+                      elif $tool == "Glob" then
+                        " " + ($i.pattern // "?")
+                        + (if $i.path then " in " + $i.path else "" end)
+                      elif $tool == "LS" then
+                        " " + ($i.path // "?")
+                      elif $tool == "WebFetch" then
+                        " " + ($i.url // "?")
+                      elif $tool == "WebSearch" then
+                        " \"" + ($i.query // "?") + "\""
+                      elif ($tool == "Task" or $tool == "Agent") then
+                        (if $i.subagent_type then " (" + $i.subagent_type + ")" else "" end)
+                      else "" end
+                    )
+                  + (
+                      if ($i.description and $tool != "Bash") then
+                        " — " + $i.description
+                      else "" end
+                    )
+                  + "]"
               else empty end
             )
           | .[]
         elif .type == "user" then
           (.message.content // [])
           | map(
-              if .type == "tool_result" then
-                "[result ← " + $who + "]"
+              # The plain "[result ← X]" echo on every tool return adds noise
+              # without information — drop it. Surface only errors, where the
+              # signal is genuinely useful.
+              if .type == "tool_result" and (.is_error // false) then
+                "[error ← " + $who + "] " + ((.content // "") | result_text | cleanline | trunc(200))
               else empty end
             )
           | .[]
