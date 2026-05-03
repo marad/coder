@@ -407,7 +407,14 @@ format_stream() {
   if [[ "${CODER_RAW:-0}" == "1" ]]; then
     cat
   else
-    jq -r --unbuffered '
+    # The actor (orchestrator vs. a subagent) is not stamped on every event —
+    # Claude Code only puts `subagent_type` on the *dispatching* Agent/Task
+    # tool_use. Nested events from inside a subagent come through as ordinary
+    # `assistant` events with `parent_tool_use_id` pointing back to that
+    # dispatch. So we keep a {tool_use_id → subagent_type} map as we go and
+    # resolve each event's actor from its parent_tool_use_id. `foreach inputs`
+    # gives us streaming with state in a single jq process.
+    jq -rn --unbuffered '
       def cleanline: gsub("\n"; " ") | gsub("[ \t]+"; " ");
       def trunc(n): if (length // 0) > n then .[:n-1] + "…" else . end;
       def result_text:
@@ -415,65 +422,89 @@ format_stream() {
         elif (. | type) == "array" then (map(.text // "") | join(" "))
         else (. | tostring) end;
 
-      (.subagent_type // .agent // .message.subagent_type // "orchestrator") as $who
-      | if .type == "system" and (.subtype // "") == "init" then
-          "[init] session started"
-        elif .type == "assistant" then
-          (.message.content // [])
-          | map(
-              if .type == "text" then
-                ($who | ascii_upcase) + ": " + (.text // "")
-              elif .type == "tool_use" then
-                (.input // {}) as $i
-                | (.name // "?") as $tool
-                | "[" + $who + " → " + $tool
-                  + (
-                      if ($tool == "Read" or $tool == "Write" or $tool == "Edit" or $tool == "MultiEdit") then
-                        " " + ($i.file_path // "?")
-                      elif $tool == "NotebookEdit" then
-                        " " + ($i.notebook_path // "?")
-                      elif $tool == "Bash" then
-                        " $ " + (($i.command // "?") | cleanline | trunc(140))
-                      elif $tool == "Grep" then
-                        " /" + ($i.pattern // "") + "/"
-                        + (if $i.path then " in " + $i.path else "" end)
-                        + (if $i.glob then " (" + $i.glob + ")" else "" end)
-                      elif $tool == "Glob" then
-                        " " + ($i.pattern // "?")
-                        + (if $i.path then " in " + $i.path else "" end)
-                      elif $tool == "LS" then
-                        " " + ($i.path // "?")
-                      elif $tool == "WebFetch" then
-                        " " + ($i.url // "?")
-                      elif $tool == "WebSearch" then
-                        " \"" + ($i.query // "?") + "\""
-                      elif ($tool == "Task" or $tool == "Agent") then
-                        (if $i.subagent_type then " (" + $i.subagent_type + ")" else "" end)
-                      else "" end
-                    )
-                  + (
-                      if ($i.description and $tool != "Bash") then
-                        " — " + $i.description
-                      else "" end
-                    )
-                  + "]"
-              else empty end
-            )
-          | .[]
-        elif .type == "user" then
-          (.message.content // [])
-          | map(
-              # The plain "[result ← X]" echo on every tool return adds noise
-              # without information — drop it. Surface only errors, where the
-              # signal is genuinely useful.
-              if .type == "tool_result" and (.is_error // false) then
-                "[error ← " + $who + "] " + ((.content // "") | result_text | cleanline | trunc(200))
-              else empty end
-            )
-          | .[]
-        elif .type == "result" then
-          "\n=== final ===\n" + (.result // "")
-        else empty end
+      # Walk parent_tool_use_id up to N hops in case a subagent dispatches
+      # another subagent. Stops at the first id we have a mapping for, or
+      # falls back to "orchestrator" when the chain dead-ends at the root.
+      def resolve($pid; $actors):
+        if $pid == null then "orchestrator"
+        elif ($actors[$pid] // null) != null then $actors[$pid]
+        else "orchestrator" end;
+
+      foreach inputs as $e (
+        {actors: {}};
+        # UPDATE: record any new dispatch ids found in this event
+        if $e.type == "assistant" then
+          reduce ( ($e.message.content // [])[]
+                   | select(.type == "tool_use"
+                            and (.name == "Agent" or .name == "Task")) ) as $a
+            (.; .actors[$a.id] = ($a.input.subagent_type // "?"))
+        else . end;
+        # EXTRACT: emit zero or more formatted lines
+        . as $state
+        | ( $e.subagent_type
+            // $e.agent
+            // $e.message.subagent_type
+            // resolve($e.parent_tool_use_id // null; $state.actors)
+          ) as $who
+        | if $e.type == "system" and ($e.subtype // "") == "init" then
+            "[init] session started"
+          elif $e.type == "assistant" then
+            ($e.message.content // [])
+            | map(
+                if .type == "text" then
+                  ($who | ascii_upcase) + ": " + (.text // "")
+                elif .type == "tool_use" then
+                  (.input // {}) as $i
+                  | (.name // "?") as $tool
+                  | "[" + $who + " → " + $tool
+                    + (
+                        if ($tool == "Read" or $tool == "Write" or $tool == "Edit" or $tool == "MultiEdit") then
+                          " " + ($i.file_path // "?")
+                        elif $tool == "NotebookEdit" then
+                          " " + ($i.notebook_path // "?")
+                        elif $tool == "Bash" then
+                          " $ " + (($i.command // "?") | cleanline | trunc(140))
+                        elif $tool == "Grep" then
+                          " /" + ($i.pattern // "") + "/"
+                          + (if $i.path then " in " + $i.path else "" end)
+                          + (if $i.glob then " (" + $i.glob + ")" else "" end)
+                        elif $tool == "Glob" then
+                          " " + ($i.pattern // "?")
+                          + (if $i.path then " in " + $i.path else "" end)
+                        elif $tool == "LS" then
+                          " " + ($i.path // "?")
+                        elif $tool == "WebFetch" then
+                          " " + ($i.url // "?")
+                        elif $tool == "WebSearch" then
+                          " \"" + ($i.query // "?") + "\""
+                        elif ($tool == "Task" or $tool == "Agent") then
+                          (if $i.subagent_type then " (" + $i.subagent_type + ")" else "" end)
+                        else "" end
+                      )
+                    + (
+                        if ($i.description and $tool != "Bash") then
+                          " — " + $i.description
+                        else "" end
+                      )
+                    + "]"
+                else empty end
+              )
+            | .[]
+          elif $e.type == "user" then
+            ($e.message.content // [])
+            | map(
+                # The plain "[result ← X]" echo on every tool return adds noise
+                # without information — drop it. Surface only errors, where the
+                # signal is genuinely useful.
+                if .type == "tool_result" and (.is_error // false) then
+                  "[error ← " + $who + "] " + ((.content // "") | result_text | cleanline | trunc(200))
+                else empty end
+              )
+            | .[]
+          elif $e.type == "result" then
+            "\n=== final ===\n" + ($e.result // "")
+          else empty end
+      )
     '
   fi
 }
